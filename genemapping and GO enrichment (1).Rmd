@@ -1,0 +1,635 @@
+---
+title: "genemapping and heatmap"
+author: "Aditi Upadhye"
+date: "2024-09-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+# Load necessary library
+library(tidyverse)
+library(dplyr)
+library(readxl)
+library(ggplot2)
+library(pheatmap)
+library(clusterProfiler)
+library(enrichplot)
+library(BioNet)
+library(stringr)
+library(pcaMethods)
+library(DESeq2)
+library(ggpubr)
+library(org.Mm.eg.db)
+library(tibble)
+
+```
+
+```{r read in intensity values from n3 sheet, echo = TRUE}
+
+intensity_raw <- read_xlsx("/Users/aditiupadhye/Desktop/Aditi/PHD/Year 1/Rehman lab/Proteomics/Lee lab colab/T Cell Lymphoma/CE3_UIC_P24035_12TCZ3_AS1-9.xlsx", sheet = 1) %>%
+  dplyr::select(4,20:28)
+
+colnames(intensity_raw) <- c("Proteins","Normal_1","LPS_outside_tcz_1","LPS_inside_tcz_1","Normal_2","LPS_outside_tcz_2","LPS_inside_tcz_2","Normal_3","LPS_outside_tcz_3","LPS_inside_tcz_3")
+
+# Assuming your data frame is named df
+#intensity_raw$Genes <- make.unique(intensity_raw$Genes)
+
+```
+
+```{r gene mapping using uniprot file, echo = TRUE}
+
+uniprot_ids <- read_xlsx("/Users/aditiupadhye/Desktop/Aditi/PHD/Year 1/Rehman lab/Proteomics/Lee lab colab/T Cell Lymphoma/uniprotkb_AND_model_organism_10090_AND_2024_10_07.xlsx")%>%
+  dplyr::select(Entry, `Gene Names`)%>%
+  dplyr::rename("Proteins"="Entry")
+
+intensity_raw_map <- intensity_raw %>%
+  left_join(.,uniprot_ids, by = "Proteins")%>%
+  mutate(`Gene Names` = gsub(" .*","",`Gene Names`))%>%
+  dplyr::select(Proteins,`Gene Names`,2:10)%>%
+  dplyr::rename("Genes"="Gene Names")
+
+intensity_raw_map$Genes <- make.unique(intensity_raw_map$Genes)
+  
+intensity_raw <- intensity_raw_map
+```
+
+```{r data normalization, echo = TRUE}
+library(dplyr)
+library(tibble)
+library(vsn)
+library(limma)
+
+# Ensure all gene names in the 'Genes' column are unique
+
+# Ensure all selected columns are numeric
+numeric_cols <- intensity_raw %>%
+  dplyr::select(-c(Proteins))%>%
+  mutate(Genes = ifelse(is.na(Genes) | Genes == "", "NA", Genes))%>%
+  column_to_rownames(var = "Genes") %>%  # Set 'Genes' as row names
+  mutate(across(starts_with("Normal_") | starts_with("LPS_outside_") | starts_with("LPS_inside_"), as.numeric))
+
+# Check if numeric conversion was successful
+str(numeric_cols)
+
+# Assuming `numeric_data` is your data matrix
+vsn_data <- normalizeVSN(as.matrix(numeric_cols))
+
+# Verify fit using meanSdPlot
+meanSdPlot(vsn_data)
+
+# Convert to a data frame for ggplot2
+normalized_df <- as.data.frame(vsn_data)
+# 
+
+
+```
+```{r data imputation, echo = TRUE}
+# Impute missing values from a normal distribution
+impute_normal <- function(x) {
+  missing <- is.na(x)
+  n_missing <- sum(missing)
+  if (n_missing > 0) {
+    imputed_values <- rnorm(n_missing, mean(x, na.rm = TRUE) - 1.8 * sd(x, na.rm = TRUE), 0.3 * sd(x, na.rm = TRUE))
+    x[missing] <- imputed_values
+  }
+  return(x)
+}
+
+# Step 2: Impute zero values
+intensity_imputed <- normalized_df %>%
+  mutate(across(starts_with("Normal") | starts_with("LPS_outside") | starts_with("LPS_inside"), impute_normal))
+
+```
+
+PCA plots
+```{r pca, echo=TRUE}
+# Step 3: Perform PCA
+# Remove Protein_ID column for PCA
+
+pca_data <- intensity_imputed 
+
+# Step 4: Perform PCA
+# Perform PCA on the log-transformed data
+pca_results <- pca(t(pca_data), method = "svd")
+
+# Extract PCA scores
+pca_scores <- as.data.frame(scores(pca_results))
+pca_scores$Sample <- rownames(pca_scores)
+
+#Prepare pheno_dat
+pheno_dat <- as.data.frame(rownames(pca_scores)) %>%
+  dplyr::rename("Sample" = "rownames(pca_scores)") %>%
+  mutate(Group = case_when(
+    grepl("Normal", Sample) ~ "Normal",
+    grepl("LPS_inside", Sample) ~ "LPS_inside",
+    grepl("LPS_outside", Sample) ~ "LPS_outside",
+    TRUE ~ "Unknown"
+  )) %>%
+  left_join(pca_scores, by = "Sample") %>%
+  mutate(batch =ifelse(Sample %in% c("Normal_1","LPS_outside_tcz_1","LPS_inside_tcz_1"),"batch_1",""))%>%
+  mutate(batch =ifelse(Sample %in% c("Normal_2","LPS_outside_tcz_2","LPS_inside_tcz_2"),"batch_2",batch))%>%
+  mutate(batch =ifelse(Sample %in% c("Normal_3","LPS_outside_tcz_3","LPS_inside_tcz_3"),"batch_3",batch))%>%
+  mutate(batch =ifelse(Sample %in% c("Normal_4","LPS_outside_tcz_4","LPS_inside_tcz_4"),"batch_4",batch))
+
+# Plot PCA results
+pca_sample <- ggplot(pheno_dat, aes(x = PC1, y = PC2, color = Sample)) +
+  geom_point() +
+  labs(title = "PCA by sample", x = "PC1", y = "PC2") +
+  theme_bw()
+
+pca_sample
+
+pca_group <- ggplot(pheno_dat, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point() +
+  labs(title = "PCA by group", x = "PC1", y = "PC2") +
+  theme_bw()
+
+pca_group
+
+pca_group <- ggplot(pheno_dat, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 3) +
+  # ADD ggforce's ellipses
+  #ggforce::geom_mark_ellipse(aes(color = batch))+
+  labs(title = "PCA by group", x = "PC1", y = "PC2") +
+  theme_bw()
+
+pca_group
+
+# pca_batch <- ggplot(pheno_dat, aes(x = PC1, y = PC2, color = batch)) +
+#   geom_point() +
+#   labs(title = "PCA by batch", x = "PC1", y = "PC2") +
+#   theme_bw()
+# 
+# pca_batch
+# 
+# pca_file <- ggplot(pheno_dat, aes(x = PC1, y = PC2, color = file)) +
+#   geom_point() +
+#   labs(title = "PCA by file", x = "PC1", y = "PC2") +
+#   theme_bw()
+# 
+# pca_file
+
+
+ggarrange(pca_sample, pca_group, nrow = 1)
+
+pca_sample <- ggplot(pheno_dat, aes(x = PC1, y = PC2, color = Group, shape = batch)) +
+  geom_point(size = 3) +
+  labs(title = "PCA by batch and group", x = "PC1", y = "PC2") +
+  theme_bw()
+
+pca_sample
+
+```
+
+## Batch correction and PCA 
+```{r batch correction, echo = TRUE}
+library(sva)
+
+
+# Convert normalized_df to a numeric matrix if it's not already
+normalized_matrix <- as.matrix(intensity_imputed)
+
+# Ensure that batch is a factor in pheno_dat
+pheno_dat$batch <- as.factor(pheno_dat$batch)
+pheno_dat$Group <- as.factor(pheno_dat$Group)
+
+# Apply ComBat to correct for batch effects
+# ComBat requires a design matrix; if no other covariates are present, use just an intercept
+# Create a design matrix
+mod <- model.matrix(~ Group, data = pheno_dat)
+
+# Apply ComBat for batch correction
+batch_corrected <- ComBat(dat = normalized_matrix,
+                           batch = pheno_dat$batch, 
+                           mod = mod,              # Use the design matrix
+                           par.prior = TRUE, 
+                           prior.plots = FALSE)    # Set to TRUE if you want to see prior plots
+
+batch_corrected <- as.data.frame(batch_corrected)
+
+# Perform PCA
+pca_result <- pca(t(batch_corrected), method = "svd")
+
+# Extract PCA scores
+pca_batch_correct <- as.data.frame(scores(pca_result))
+pca_batch_correct$Sample <- rownames(pca_batch_correct)
+
+
+pheno_dat <- pheno_dat %>%
+  left_join(pca_batch_correct, by = "Sample") 
+
+
+
+pca_batch <- ggplot(pheno_dat, aes(x = PC1.y, y = PC2.y, color = batch)) +
+  geom_point(size = 3) +
+  # ADD ggforce's ellipses
+  #ggforce::geom_mark_ellipse(aes(color = batch))+
+  labs(title = "PCA by batch", x = "PC1", y = "PC2") +
+  theme_bw()
+
+pca_batch
+
+
+
+pca_group <- ggplot(pheno_dat, aes(x = PC1.y, y = PC2.y, color = Group)) +
+  geom_point(size = 3) +
+  # ADD ggforce's ellipses
+  #ggforce::geom_mark_ellipse(aes(color = batch))+
+  labs(title = "PCA by group", x = "PC1", y = "PC2") +
+  theme_bw()
+
+pca_group
+# 
+# pca_file <- ggplot(pheno_dat, aes(x = PC1, y = PC2, color = file)) +
+#   geom_point() +
+#   labs(title = "PCA by file", x = "PC1", y = "PC2") +
+#   theme_bw()
+# 
+# pca_file
+
+pca_sample <- ggplot(pheno_dat, aes(x = PC1.y, y = PC2.y, color = Sample, shape = Group)) +
+  geom_point(size = 3) +
+  labs(title = "PCA by sample and treatment", x = "PC1", y = "PC2") +
+  theme_bw()
+
+pca_sample
+
+pca_sample <- ggplot(pheno_dat, aes(x = PC1.y, y = PC2.y, color = Group, shape = batch)) +
+  geom_point(size = 3) +
+  labs(title = "PCA by batch and group", x = "PC1", y = "PC2") +
+  theme_bw()
+
+pca_sample
+
+```
+
+
+
+```{r intensity heatmap for selected proteins, echo = TRUE}
+intensity_heatmap <- batch_corrected %>%
+  as.data.frame()%>%
+  dplyr::select(starts_with("Normal_") | starts_with("LPS_outside") | starts_with("LPS_inside"))
+
+# Step 5: Create heatmap
+# Select top proteins based on variance for visualization
+top_proteins <- apply(intensity_heatmap, 1, var) %>%
+  sort(decreasing = TRUE) %>%
+  head(30) %>%
+  names()
+
+selected_proteins <- c("Wnk1", "Oxsr1", "Pycard", "Dock8", "Coro1a", 
+                       "Fadd", "Rhoa", "Adam10", "Cxcl10", "Ptk2b", 
+                       "Lgals9", "Aif1", "Itgb3", "Med23","Spn")
+
+
+
+heatmap_data <- intensity_heatmap[selected_proteins, ]
+
+pheatmap(heatmap_data, scale = "row", cluster_rows = TRUE, cluster_cols = FALSE,
+         main = "Lymphocyte Migration")
+
+# Load necessary library
+library(pheatmap)
+
+# Customizing the heatmap
+pheatmap(heatmap_data, 
+         scale = "row",                     # Scale each row (protein)
+         cluster_rows = TRUE,               # Cluster rows
+         cluster_cols = FALSE,              # Do not cluster columns
+         color = colorRampPalette(c("navy", "lightblue", "firebrick3"))(5),  # Custom color palette
+         main = "Lymphocyte Migration",  # Title of the heatmap
+         fontsize = 10,                     # Font size for the heatmap
+         fontsize_row = 8,                  # Font size for row names
+         fontsize_col = 10,                 # Font size for column names
+         border_color = "black",                 # No border color around cells
+         cellwidth = 30,                    # Width of the cells
+         cellheight = 10,                   # Height of the cells
+         legend = TRUE,                     # Show legend
+         legend_breaks = c(-2, -1, 0, 1, 2),# Custom breaks for legend, adjust based on your data
+         legend_labels = c("-2", "-1", "0", "1", "2"),  # Intensity values as legend labels
+         treeheight_row = 50,               # Height of the row dendrogram
+         treeheight_col = 0,                # No column dendrogram
+         show_rownames = TRUE,              # Show row names (proteins)
+         show_colnames = TRUE               # Show column names (samples)
+)
+```
+
+
+
+
+
+```{r perform differential expression analysis, echo = TRUE}
+
+library(limma)
+library(edgeR)
+library(ggrepel)
+# Define group information
+Group <- factor(pheno_dat$Group)
+
+# Create a design matrix
+design <- model.matrix(~0 + Group)
+colnames(design) <- levels(Group)
+
+# Define contrasts
+contrasts <- makeContrasts(
+  NormvsLPS_in = LPS_inside - Normal,
+  NormvsLPS_out = LPS_outside - Normal,
+  LPS_invsLPS_out = LPS_inside - LPS_outside,
+  levels = design
+)
+
+# Fit linear model
+fit <- lmFit(batch_corrected, design)
+fit2 <- contrasts.fit(fit, contrasts)
+fit2 <- eBayes(fit2)
+
+# Extract results for each contrast
+results_NormvsLPS_in <- topTable(fit2, coef = "NormvsLPS_in", adjust = "BH", number = Inf) %>%
+  rownames_to_column(var = "Genes")
+results_NormvsLPS_out <- topTable(fit2, coef = "NormvsLPS_out", adjust = "BH", number = Inf)%>%
+  rownames_to_column(var = "Genes")
+results_LPS_invsLPS_out <- topTable(fit2, coef = "LPS_invsLPS_out", adjust = "BH", number = Inf)%>%
+  rownames_to_column(var = "Genes")
+
+## plot volcano plot
+plot_volcano <- function(results, contrast_name) {
+  results$Significance <- ifelse(results$adj.P.Val < 0.05 & results$logFC > 1, "Upregulated",
+                          ifelse(results$adj.P.Val < 0.05 & results$logFC < - 1, "Downregulated", "Not Significant"))
+
+  ggplot(results, aes(x = logFC, y = -log10(P.Value))) +
+    geom_point(aes(color = Significance), alpha = 0.5) +
+    scale_color_manual(values = c("Upregulated" = "red", "Downregulated" = "blue", "Not Significant" = "gray")) +
+    geom_text_repel(aes(label = ifelse(Significance != "Not Significant", Genes, "")),
+                    size = 3, max.overlaps = 15) +
+    labs(title = paste("Volcano Plot:", contrast_name),
+         x = "Log2 Fold Change",
+         y = "-Log10 P-Value") +
+    theme_minimal()
+}
+
+
+# Plot volcano plots for each contrast
+plot_volcano(results_NormvsLPS_in, "LPS_inside vs Normal")
+plot_volcano(results_NormvsLPS_out, "LPS_outside vs Normal")
+plot_volcano(results_LPS_invsLPS_out, "LPS_inside vs LPS_outside")
+
+
+
+```
+
+
+```{r GO enrichment on upregulated group, echo = TRUE}
+
+# Load necessary libraries
+library(dplyr)
+library(clusterProfiler)  # For enrichGO
+library(org.Mm.eg.db)     # For mouse gene database
+library(ggplot2)          # For additional plotting options
+
+# Filtering up-regulated genes
+norm_vs_lpsin_up <- results_NormvsLPS_in %>%
+  filter(adj.P.Val < 0.05) %>%
+  filter(logFC > 1)
+
+# GO enrichment for up-regulated genes
+norm_vs_lpsin_up_Go <- enrichGO(
+  gene = norm_vs_lpsin_up$Genes,
+  universe = intensity_raw$Genes,  # Background gene list
+  OrgDb = org.Mm.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",  # Can be "BP", "MF", or "CC"
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+# Check if there are any enriched GO terms for up-regulated genes
+if (!is.null(norm_vs_lpsin_up_Go) && nrow(norm_vs_lpsin_up_Go) > 0) {
+  # Bar plot for up-regulated genes
+  barplot(norm_vs_lpsin_up_Go, showCategory = 16, main = "GO Enrichment for Up-regulated Genes")
+} else {
+  message("No enriched GO terms for up-regulated genes.")
+}
+
+# Filtering down-regulated genes
+norm_vs_lpsin_down <- results_NormvsLPS_in %>%
+  filter(adj.P.Val < 0.05) %>%
+  filter(logFC < -1)
+
+# GO enrichment for down-regulated genes
+norm_vs_lpsin_down_Go <- enrichGO(
+  gene = norm_vs_lpsin_down$Genes,
+  universe = intensity_raw$Genes,  # Background gene list
+  OrgDb = org.Mm.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",  # Can be "BP", "MF", or "CC"
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+
+# Combine the results
+lpsin_results <- norm_vs_lpsin_up_Go@result %>%
+  dplyr::select(ID, Description, pvalue, Count) %>%
+  mutate(Group = "LPS_inside")
+
+norm_results <- norm_vs_lpsin_down_Go@result %>%
+  dplyr::select(ID, Description, pvalue, Count) %>%
+  mutate(Group = "Normal")
+
+# Combine the data
+go_combined <- bind_rows(lpsin_results, norm_results)
+
+# Adjust p-values for better visual comparison (optional, log-transform)
+go_combined$pvalue <- -log10(go_combined$pvalue)
+
+# Select the top GO terms (e.g., 15) based on p-values from each group
+top_terms <- go_combined %>%
+  group_by(Group) %>%
+  top_n(-15, pvalue) %>%  # Take the top 15 terms per group
+  ungroup()
+
+# Plot the bar plot comparing the two groups
+ggplot(top_terms, aes(x = reorder(Description, pvalue), y = pvalue, fill = Group)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(title = "GO Enrichment Comparison -- LPS_inside vs Normal",
+       x = "GO Terms", y = "-log10(p-value)") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8)) +
+  scale_fill_manual(values = c("LPS_inside" = "red", "Normal" = "blue"))
+
+
+```
+
+```{r go enrichment Lps_out vs normal, echo = TRUE}
+# Load necessary libraries
+library(dplyr)
+library(clusterProfiler)  # For enrichGO
+library(org.Mm.eg.db)     # For mouse gene database
+library(ggplot2)          # For additional plotting options
+
+# Filtering up-regulated genes
+norm_vs_lpsout_up <- results_NormvsLPS_out %>%
+  filter(adj.P.Val < 0.05) %>%
+  filter(logFC > 1)
+
+# GO enrichment for up-regulated genes
+norm_vs_lpsout_up_Go <- enrichGO(
+  gene = norm_vs_lpsout_up$Genes,
+  universe = intensity_raw$Genes,  # Background gene list
+  OrgDb = org.Mm.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",  # Can be "BP", "MF", or "CC"
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+# Check if there are any enriched GO terms for up-regulated genes
+if (!is.null(norm_vs_lpsout_up_Go) && nrow(norm_vs_lpsout_up_Go) > 0) {
+  # Bar plot for up-regulated genes
+  barplot(norm_vs_lpsout_up_Go, showCategory = 16, main = "GO Enrichment for Up-regulated Genes")
+} else {
+  message("No enriched GO terms for up-regulated genes.")
+}
+
+# Filtering down-regulated genes
+norm_vs_lpsout_down <- results_NormvsLPS_out %>%
+  filter(adj.P.Val < 0.05) %>%
+  filter(logFC < -1)
+
+# GO enrichment for down-regulated genes
+norm_vs_lpsout_down_Go <- enrichGO(
+  gene = norm_vs_lpsout_down$Genes,
+  universe = intensity_raw$Genes,  # Background gene list
+  OrgDb = org.Mm.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",  # Can be "BP", "MF", or "CC"
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+# Combine the results
+lpsout_results <- norm_vs_lpsout_up_Go@result %>%
+  dplyr::select(ID, Description, pvalue, Count) %>%
+  mutate(Group = "LPS_outside")
+
+norm_results <- norm_vs_lpsout_down_Go@result %>%
+  dplyr::select(ID, Description, pvalue, Count) %>%
+  mutate(Group = "Normal")
+
+# Combine the data
+go_combined <- bind_rows(lpsout_results, norm_results)
+
+# Adjust p-values for better visual comparison (optional, log-transform)
+go_combined$pvalue <- -log10(go_combined$pvalue)
+
+# Select the top GO terms (e.g., 15) based on p-values from each group
+top_terms <- go_combined %>%
+  group_by(Group) %>%
+  top_n(-15, pvalue) %>%  # Take the top 15 terms per group
+  ungroup()
+
+# Plot the bar plot comparing the two groups
+ggplot(top_terms, aes(x = reorder(Description, pvalue), y = pvalue, fill = Group)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(title = "GO Enrichment Comparison -- LPS_outside vs Normal",
+       x = "GO Terms", y = "-log10(p-value)") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8)) +
+  scale_fill_manual(values = c("LPS_outside" = "red", "Normal" = "blue"))
+```
+
+```{r go enrichment Lps_out vs Lps_in, echo = TRUE}
+# Load necessary libraries
+library(dplyr)
+library(clusterProfiler)  # For enrichGO
+library(org.Mm.eg.db)     # For mouse gene database
+library(ggplot2)          # For additional plotting options
+
+# Filtering up-regulated genes
+lpsin_vs_lpsout_up <- results_LPS_invsLPS_out %>%
+  filter(adj.P.Val < 0.05) %>%
+  filter(logFC > 1)
+
+# GO enrichment for up-regulated genes
+lpsin_vs_lpsout_up_Go <- enrichGO(
+  gene = lpsin_vs_lpsout_up$Genes,
+  universe = intensity_raw$Genes,  # Background gene list
+  OrgDb = org.Mm.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",  # Can be "BP", "MF", or "CC"
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+# Check if there are any enriched GO terms for up-regulated genes
+if (!is.null(lpsin_vs_lpsout_up_Go) && nrow(lpsin_vs_lpsout_up_Go) > 0) {
+  # Bar plot for up-regulated genes
+  barplot(lpsin_vs_lpsout_up_Go, showCategory = 16, main = "GO Enrichment for Up-regulated Genes")
+} else {
+  message("No enriched GO terms for up-regulated genes.")
+}
+
+# Filtering down-regulated genes
+lpsin_vs_lpsout_down <- results_LPS_invsLPS_out %>%
+  filter(adj.P.Val < 0.05) %>%
+  filter(logFC < -1)
+
+# GO enrichment for down-regulated genes
+lpsin_vs_lpsout_down_Go <- enrichGO(
+  gene = lpsin_vs_lpsout_down$Genes,
+  universe = intensity_raw$Genes,  # Background gene list
+  OrgDb = org.Mm.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",  # Can be "BP", "MF", or "CC"
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+
+# Combine the results
+lpsout_results <- lpsin_vs_lpsout_up_Go@result %>%
+  dplyr::select(ID, Description, pvalue, Count) %>%
+  mutate(Group = "LPS_outside")
+
+lpsin_results <- lpsin_vs_lpsout_down_Go@result %>%
+  dplyr::select(ID, Description, pvalue, Count) %>%
+  mutate(Group = "LPS_inside")
+
+# Combine the data
+go_combined <- bind_rows(lpsout_results, lpsin_results)
+
+# Adjust p-values for better visual comparison (optional, log-transform)
+go_combined$pvalue <- -log10(go_combined$pvalue)
+
+# Select the top GO terms (e.g., 15) based on p-values from each group
+top_terms <- go_combined %>%
+  group_by(Group) %>%
+  top_n(-15, pvalue) %>%  # Take the top 15 terms per group
+  ungroup()
+
+# Plot the bar plot comparing the two groups
+ggplot(top_terms, aes(x = reorder(Description, pvalue), y = pvalue, fill = Group)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(title = "GO Enrichment -- LPS_outside vs LPS_inside",
+       x = "GO Terms", y = "-log10(p-value)") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8)) +
+  scale_fill_manual(values = c("LPS_inside" = "red", "LPS_outside" = "blue"))
+```
+
+
+
+
+
+
